@@ -1,0 +1,255 @@
+# Multi-Tenant RBAC Policy for ArgoCD
+# This configuration provides role-based access control for different teams and environments
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: argocd-rbac-cm
+  namespace: argocd
+  labels:
+    app.kubernetes.io/name: argocd-rbac-cm
+    app.kubernetes.io/part-of: argocd
+data:
+  # RBAC Policy Configuration
+  policy.default: role:readonly
+  policy.csv: |
+    # Platform Admin Role - Full access to all resources
+    p, role:platform-admin, applications, *, */*, allow
+    p, role:platform-admin, clusters, *, *, allow
+    p, role:platform-admin, repositories, *, *, allow
+    p, role:platform-admin, projects, *, *, allow
+    p, role:platform-admin, accounts, *, *, allow
+    p, role:platform-admin, gpgkeys, *, *, allow
+    p, role:platform-admin, certificates, *, *, allow
+    
+    # DevOps Engineer Role - Cluster-wide read, system namespace write
+    p, role:devops-engineer, applications, get, */*, allow
+    p, role:devops-engineer, applications, list, */*, allow
+    p, role:devops-engineer, applications, create, argocd/*, allow
+    p, role:devops-engineer, applications, update, argocd/*, allow
+    p, role:devops-engineer, applications, delete, argocd/*, allow
+    p, role:devops-engineer, applications, sync, */*, allow
+    p, role:devops-engineer, applications, override, */*, allow
+    p, role:devops-engineer, clusters, get, *, allow
+    p, role:devops-engineer, repositories, get, *, allow
+    p, role:devops-engineer, repositories, list, *, allow
+    p, role:devops-engineer, projects, get, *, allow
+    p, role:devops-engineer, projects, list, *, allow
+    
+    # Development Team Role - Access to dev namespaces
+    p, role:dev-team, applications, get, dev-*, allow
+    p, role:dev-team, applications, list, dev-*, allow
+    p, role:dev-team, applications, create, dev-*, allow
+    p, role:dev-team, applications, update, dev-*, allow
+    p, role:dev-team, applications, delete, dev-*, allow
+    p, role:dev-team, applications, sync, dev-*, allow
+    p, role:dev-team, applications, logs, dev-*, allow
+    p, role:dev-team, repositories, get, https://github.com/*/dev-*, allow
+    p, role:dev-team, projects, get, dev-project, allow
+    
+    # Production Team Role - Access to prod namespaces (limited)
+    p, role:prod-team, applications, get, prod-*, allow
+    p, role:prod-team, applications, list, prod-*, allow
+    p, role:prod-team, applications, sync, prod-*, allow
+    p, role:prod-team, applications, logs, prod-*, allow
+    p, role:prod-team, repositories, get, https://github.com/*/prod-*, allow
+    p, role:prod-team, projects, get, prod-project, allow
+    
+    # QA Team Role - Read access to staging and prod
+    p, role:qa-team, applications, get, staging-*, allow
+    p, role:qa-team, applications, get, prod-*, allow
+    p, role:qa-team, applications, list, staging-*, allow
+    p, role:qa-team, applications, list, prod-*, allow
+    p, role:qa-team, applications, logs, staging-*, allow
+    p, role:qa-team, applications, logs, prod-*, allow
+    p, role:qa-team, repositories, get, *, allow
+    p, role:qa-team, projects, get, staging-project, allow
+    p, role:qa-team, projects, get, prod-project, allow
+    
+    # Security Team Role - Read-only access to all resources
+    p, role:security-team, applications, get, */*, allow
+    p, role:security-team, applications, list, */*, allow
+    p, role:security-team, clusters, get, *, allow
+    p, role:security-team, repositories, get, *, allow
+    p, role:security-team, projects, get, *, allow
+    p, role:security-team, accounts, get, *, allow
+    
+    # Read-only Role - Default minimal access
+    p, role:readonly, applications, get, */*, allow
+    p, role:readonly, applications, list, */*, allow
+    p, role:readonly, projects, get, *, allow
+    
+    # Group Mappings (OIDC/SAML groups to ArgoCD roles)
+    g, platform-admins, role:platform-admin
+    g, devops-engineers, role:devops-engineer
+    g, development-team, role:dev-team
+    g, production-team, role:prod-team
+    g, qa-team, role:qa-team
+    g, security-team, role:security-team
+    
+    # Individual User Mappings (examples)
+    g, admin@example.com, role:platform-admin
+    g, devops-lead@example.com, role:devops-engineer
+    g, dev-lead@example.com, role:dev-team
+    g, prod-lead@example.com, role:prod-team
+    g, qa-lead@example.com, role:qa-team
+    g, security-lead@example.com, role:security-team
+
+  # OIDC Configuration (example for integration with external identity providers)
+  oidc.config: |
+    name: OIDC
+    issuer: https://your-oidc-provider.com
+    clientId: argocd-client-id
+    clientSecret: $oidc.clientSecret
+    requestedScopes: ["openid", "profile", "email", "groups"]
+    requestedIDTokenClaims: {"groups": {"essential": true}}
+
+---
+# ArgoCD Projects for Multi-Tenant Isolation
+apiVersion: argoproj.io/v1alpha1
+kind: AppProject
+metadata:
+  name: dev-project
+  namespace: argocd
+  labels:
+    environment: development
+spec:
+  description: Development environment project
+  sourceRepos:
+  - 'https://github.com/*/dev-*'
+  - 'https://helm.example.com/dev-charts'
+  destinations:
+  - namespace: 'dev-*'
+    server: https://kubernetes.default.svc
+  - namespace: development
+    server: https://kubernetes.default.svc
+  clusterResourceWhitelist:
+  - group: ''
+    kind: Namespace
+  - group: 'networking.k8s.io'
+    kind: NetworkPolicy
+  namespaceResourceWhitelist:
+  - group: ''
+    kind: ConfigMap
+  - group: ''
+    kind: Secret
+  - group: ''
+    kind: Service
+  - group: 'apps'
+    kind: Deployment
+  - group: 'apps'
+    kind: ReplicaSet
+  - group: 'networking.k8s.io'
+    kind: Ingress
+  roles:
+  - name: dev-admin
+    description: Admin role for development project
+    policies:
+    - p, proj:dev-project:dev-admin, applications, *, dev-project/*, allow
+    groups:
+    - development-team
+
+---
+apiVersion: argoproj.io/v1alpha1
+kind: AppProject
+metadata:
+  name: prod-project
+  namespace: argocd
+  labels:
+    environment: production
+spec:
+  description: Production environment project
+  sourceRepos:
+  - 'https://github.com/*/prod-*'
+  - 'https://helm.example.com/prod-charts'
+  destinations:
+  - namespace: 'prod-*'
+    server: https://kubernetes.default.svc
+  - namespace: production
+    server: https://kubernetes.default.svc
+  clusterResourceWhitelist:
+  - group: ''
+    kind: Namespace
+  - group: 'networking.k8s.io'
+    kind: NetworkPolicy
+  namespaceResourceWhitelist:
+  - group: ''
+    kind: ConfigMap
+  - group: ''
+    kind: Secret
+  - group: ''
+    kind: Service
+  - group: 'apps'
+    kind: Deployment
+  - group: 'apps'
+    kind: ReplicaSet
+  - group: 'networking.k8s.io'
+    kind: Ingress
+  - group: 'autoscaling'
+    kind: HorizontalPodAutoscaler
+  syncWindows:
+  - kind: allow
+    schedule: '0 9-17 * * MON-FRI'
+    duration: 8h
+    applications:
+    - '*'
+    manualSync: false
+  - kind: deny
+    schedule: '0 0-8,18-23 * * *'
+    duration: 10h
+    applications:
+    - '*'
+    manualSync: true
+  roles:
+  - name: prod-deployer
+    description: Deployment role for production project
+    policies:
+    - p, proj:prod-project:prod-deployer, applications, sync, prod-project/*, allow
+    - p, proj:prod-project:prod-deployer, applications, get, prod-project/*, allow
+    groups:
+    - production-team
+
+---
+apiVersion: argoproj.io/v1alpha1
+kind: AppProject
+metadata:
+  name: staging-project
+  namespace: argocd
+  labels:
+    environment: staging
+spec:
+  description: Staging environment project
+  sourceRepos:
+  - 'https://github.com/*/staging-*'
+  - 'https://helm.example.com/staging-charts'
+  destinations:
+  - namespace: 'staging-*'
+    server: https://kubernetes.default.svc
+  - namespace: staging
+    server: https://kubernetes.default.svc
+  clusterResourceWhitelist:
+  - group: ''
+    kind: Namespace
+  - group: 'networking.k8s.io'
+    kind: NetworkPolicy
+  namespaceResourceWhitelist:
+  - group: ''
+    kind: ConfigMap
+  - group: ''
+    kind: Secret
+  - group: ''
+    kind: Service
+  - group: 'apps'
+    kind: Deployment
+  - group: 'apps'
+    kind: ReplicaSet
+  - group: 'networking.k8s.io'
+    kind: Ingress
+  roles:
+  - name: staging-admin
+    description: Admin role for staging project
+    policies:
+    - p, proj:staging-project:staging-admin, applications, *, staging-project/*, allow
+    groups:
+    - qa-team
+    - development-team

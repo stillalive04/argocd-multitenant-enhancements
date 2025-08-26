@@ -1,0 +1,297 @@
+# ApplicationSet for Blue-Green Deployment Strategy
+# Enables zero-downtime deployments with instant traffic switching
+
+apiVersion: argoproj.io/v1alpha1
+kind: ApplicationSet
+metadata:
+  name: bluegreen-deployment
+  namespace: argocd
+  labels:
+    strategy: blue-green
+    team: platform
+spec:
+  generators:
+  - clusters:
+      selector:
+        matchLabels:
+          environment: production
+          deployment-strategy: blue-green
+      values:
+        environment: '{{metadata.labels.environment}}'
+        cluster: '{{name}}'
+  - git:
+      repoURL: https://github.com/your-org/app-configs
+      revision: HEAD
+      directories:
+      - path: apps/*/blue-green
+      values:
+        app: '{{path.basename}}'
+        path: '{{path}}'
+  template:
+    metadata:
+      name: '{{values.app}}-{{values.environment}}-bluegreen'
+      labels:
+        app: '{{values.app}}'
+        environment: '{{values.environment}}'
+        strategy: blue-green
+      annotations:
+        argocd.argoproj.io/sync-wave: "1"
+        notifications.argoproj.io/subscribe.on-sync-succeeded.slack: deployment-alerts
+    spec:
+      project: '{{values.environment}}-project'
+      source:
+        repoURL: https://github.com/your-org/helm-charts
+        targetRevision: HEAD
+        path: charts/{{values.app}}
+        helm:
+          valueFiles:
+          - values-{{values.environment}}.yaml
+          - values-blue-green.yaml
+          parameters:
+          - name: image.tag
+            value: '{{values.version | default "latest"}}'
+          - name: deployment.strategy
+            value: blue-green
+          - name: bluegreen.enabled
+            value: "true"
+          - name: bluegreen.autoPromotionEnabled
+            value: "false"  # Manual promotion for safety
+          - name: bluegreen.scaleDownDelaySeconds
+            value: "30"
+          - name: bluegreen.prePromotionAnalysis.templates[0].templateName
+            value: success-rate
+          - name: bluegreen.prePromotionAnalysis.args[0].name
+            value: service-name
+          - name: bluegreen.prePromotionAnalysis.args[0].value
+            value: '{{values.app}}-{{values.environment}}'
+      destination:
+        server: '{{server}}'
+        namespace: '{{values.environment}}-{{values.app}}'
+      syncPolicy:
+        automated:
+          prune: true
+          selfHeal: true
+          allowEmpty: false
+        syncOptions:
+        - CreateNamespace=true
+        - PruneLast=true
+        - RespectIgnoreDifferences=true
+        retry:
+          limit: 5
+          backoff:
+            duration: 5s
+            factor: 2
+            maxDuration: 3m
+      revisionHistoryLimit: 10
+
+---
+# Rollout Configuration for Blue-Green Strategy
+apiVersion: argoproj.io/v1alpha1
+kind: Rollout
+metadata:
+  name: bluegreen-rollout-template
+  namespace: argocd
+  labels:
+    template: blue-green
+spec:
+  replicas: 5
+  strategy:
+    blueGreen:
+      # Traffic routing
+      activeService: active-service
+      previewService: preview-service
+      
+      # Automatic promotion (disabled for manual control)
+      autoPromotionEnabled: false
+      
+      # Scale down delay after promotion
+      scaleDownDelaySeconds: 30
+      
+      # Pre-promotion analysis
+      prePromotionAnalysis:
+        templates:
+        - templateName: success-rate
+        args:
+        - name: service-name
+          value: preview-service
+        - name: prometheus-server
+          value: http://prometheus.monitoring.svc.cluster.local:9090
+        
+      # Post-promotion analysis
+      postPromotionAnalysis:
+        templates:
+        - templateName: success-rate
+        args:
+        - name: service-name
+          value: active-service
+        - name: prometheus-server
+          value: http://prometheus.monitoring.svc.cluster.local:9090
+          
+  selector:
+    matchLabels:
+      app: myapp
+      strategy: blue-green
+      
+  template:
+    metadata:
+      labels:
+        app: myapp
+        strategy: blue-green
+    spec:
+      containers:
+      - name: app
+        image: myapp:latest
+        ports:
+        - containerPort: 8080
+        resources:
+          requests:
+            memory: 512Mi
+            cpu: 500m
+          limits:
+            memory: 1Gi
+            cpu: 1000m
+        livenessProbe:
+          httpGet:
+            path: /health/live
+            port: 8080
+          initialDelaySeconds: 30
+          periodSeconds: 10
+        readinessProbe:
+          httpGet:
+            path: /health/ready
+            port: 8080
+          initialDelaySeconds: 10
+          periodSeconds: 5
+
+---
+# Analysis Template for Success Rate Monitoring
+apiVersion: argoproj.io/v1alpha1
+kind: AnalysisTemplate
+metadata:
+  name: success-rate
+  namespace: argocd
+spec:
+  args:
+  - name: service-name
+  - name: prometheus-server
+    value: http://prometheus.monitoring.svc.cluster.local:9090
+  metrics:
+  - name: success-rate
+    interval: 30s
+    count: 10
+    successCondition: result[0] >= 0.95
+    failureLimit: 3
+    provider:
+      prometheus:
+        address: "{{args.prometheus-server}}"
+        query: |
+          sum(rate(http_requests_total{service="{{args.service-name}}", status!~"5.."}[2m])) /
+          sum(rate(http_requests_total{service="{{args.service-name}}"}[2m]))
+  - name: avg-response-time
+    interval: 30s
+    count: 10
+    successCondition: result[0] <= 500
+    failureLimit: 3
+    provider:
+      prometheus:
+        address: "{{args.prometheus-server}}"
+        query: |
+          histogram_quantile(0.95,
+            sum(rate(http_request_duration_seconds_bucket{service="{{args.service-name}}"}[2m])) by (le)
+          ) * 1000
+
+---
+# Services for Blue-Green Deployment
+apiVersion: v1
+kind: Service
+metadata:
+  name: active-service-template
+  namespace: argocd
+  labels:
+    template: blue-green
+spec:
+  selector:
+    app: myapp
+    strategy: blue-green
+  ports:
+  - port: 80
+    targetPort: 8080
+    protocol: TCP
+  type: ClusterIP
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: preview-service-template
+  namespace: argocd
+  labels:
+    template: blue-green
+spec:
+  selector:
+    app: myapp
+    strategy: blue-green
+  ports:
+  - port: 80
+    targetPort: 8080
+    protocol: TCP
+  type: ClusterIP
+
+---
+# Ingress for Blue-Green with Traffic Splitting
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: bluegreen-ingress-template
+  namespace: argocd
+  labels:
+    template: blue-green
+  annotations:
+    kubernetes.io/ingress.class: nginx
+    nginx.ingress.kubernetes.io/canary: "false"
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+spec:
+  tls:
+  - hosts:
+    - myapp.example.com
+    secretName: myapp-tls
+  rules:
+  - host: myapp.example.com
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: active-service
+            port:
+              number: 80
+
+---
+# Preview Ingress for Blue-Green Testing
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: bluegreen-preview-ingress-template
+  namespace: argocd
+  labels:
+    template: blue-green
+  annotations:
+    kubernetes.io/ingress.class: nginx
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+spec:
+  tls:
+  - hosts:
+    - preview-myapp.example.com
+    secretName: preview-myapp-tls
+  rules:
+  - host: preview-myapp.example.com
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: preview-service
+            port:
+              number: 80
